@@ -399,19 +399,23 @@ with tab_summary:
 
     def scorecard_row(label, frame):
         a = frame["act"].sum()
+        m = frame["ml"].sum()
+        u = frame["user"].sum()
         em = frame["err_ml"].sum()
         eu = frame["err_user"].sum()
         wm_ml = wmape(em, a)
         wm_user = wmape(eu, a)
         return {
             "Scope": label,
+            "ML FC": m,
+            "User FC": u,
             "Shipped units": a,
             "Σ |ML − Act|": em,
             "Σ |User − Act|": eu,
             "FC Acc — ML": np.nan if pd.isna(wm_ml) else max(0.0, 1 - wm_ml),
             "FC Acc — User": np.nan if pd.isna(wm_user) else max(0.0, 1 - wm_user),
-            "FC Bias — ML": (frame["ml"].sum() - a) / a if a else np.nan,
-            "FC Bias — User": (frame["user"].sum() - a) / a if a else np.nan,
+            "FC Bias — ML": (m - a) / a if a else np.nan,
+            "FC Bias — User": (u - a) / a if a else np.nan,
             "FVA": (wm_ml - wm_user
                     if pd.notna(wm_ml) and pd.notna(wm_user) else np.nan),
         }
@@ -442,6 +446,10 @@ with tab_summary:
                 format="percent",
                 help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
             "Shipped units": st.column_config.NumberColumn(format="%,.0f"),
+            "ML FC": st.column_config.NumberColumn(
+                format="%,.0f", help="Total ML forecast over the window."),
+            "User FC": st.column_config.NumberColumn(
+                format="%,.0f", help="Total user/consensus forecast over the window."),
             "Σ |ML − Act|": st.column_config.NumberColumn(format="%,.0f"),
             "Σ |User − Act|": st.column_config.NumberColumn(format="%,.0f"),
         },
