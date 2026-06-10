@@ -220,7 +220,13 @@ if not level_cols:
 # 3 · Settings
 # -----------------------------------------------------------------------------
 st.sidebar.header("3 · Verdict settings")
-months_sorted = sorted(raw[col_month].dropna().unique().tolist())
+months_all = sorted(raw[col_month].dropna().unique().tolist())
+months_sorted = months_all[-12:]  # always cap analysis at the last 12 months
+if len(months_all) > 12:
+    st.sidebar.caption(
+        f"ℹ️ File contains {len(months_all)} periods — analysis automatically "
+        f"limited to the most recent 12 ({months_sorted[0]} → {months_sorted[-1]})."
+    )
 window = st.sidebar.slider(
     "Trailing window (most recent months used for the verdict)",
     min_value=1, max_value=len(months_sorted), value=len(months_sorted),
@@ -381,12 +387,132 @@ if n_shadow:
 # -----------------------------------------------------------------------------
 # 7 · Tabs: verdict table · scatter · drill-in
 # -----------------------------------------------------------------------------
-tab_table, tab_scatter, tab_drill = st.tabs(
-    ["📋 Verdict table", "📈 ML vs User error map", "🔬 Item drill-in"])
+tab_summary, tab_table, tab_scatter, tab_drill = st.tabs(
+    ["📊 Summary", "📋 Verdict table", "📈 ML vs User error map",
+     "🔬 Item drill-in"])
 
 display_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
                              "wmape_user", "user_win_rate", "bias_user",
                              "bias_ml", "act_sum", "months"]
+
+with tab_summary:
+    # ---- Whole-dataset scorecard --------------------------------------------
+    st.subheader("Whole-dataset scorecard")
+    st.caption("Errors computed at the chosen analysis level per month, then "
+               "summed over the window — last 12 months max.")
+
+    tot_act = grp_month["act"].sum()
+    tot_err_ml = grp_month["err_ml"].sum()
+    tot_err_user = grp_month["err_user"].sum()
+    wm_ml_tot = wmape(tot_err_ml, tot_act)
+    wm_user_tot = wmape(tot_err_user, tot_act)
+    fa_ml_tot = np.nan if pd.isna(wm_ml_tot) else max(0.0, 1 - wm_ml_tot)
+    fa_user_tot = np.nan if pd.isna(wm_user_tot) else max(0.0, 1 - wm_user_tot)
+    fva_tot = (wm_ml_tot - wm_user_tot
+               if pd.notna(wm_ml_tot) and pd.notna(wm_user_tot) else np.nan)
+
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Shipped units", f"{tot_act:,.0f}")
+    s2.metric("Σ |ML − Actual|", f"{tot_err_ml:,.0f}")
+    s3.metric("Σ |User − Actual|", f"{tot_err_user:,.0f}",
+              delta=f"{tot_err_ml - tot_err_user:,.0f} vs ML",
+              delta_color="normal")
+    s4.metric("Forecast Accuracy — ML", fmt_pct(fa_ml_tot),
+              help="FA = 1 − WMAPE, floored at 0.")
+    s5.metric("Forecast Accuracy — User", fmt_pct(fa_user_tot))
+
+    if pd.isna(fva_tot):
+        st.info("Not enough shipped volume in the window for an overall verdict.")
+    elif fva_tot >= fva_threshold:
+        st.success(
+            f"**Overall verdict: 👤 the user forecast adds value** — "
+            f"FA {fmt_pct(fa_user_tot)} vs {fmt_pct(fa_ml_tot)} for ML "
+            f"(FVA {fva_tot:+.0%})."
+        )
+    elif fva_tot <= -fva_threshold:
+        st.error(
+            f"**Overall verdict: 🤖 ML would be more accurate** — "
+            f"FA {fmt_pct(fa_ml_tot)} vs {fmt_pct(fa_user_tot)} for the user "
+            f"forecast (FVA {fva_tot:+.0%})."
+        )
+    else:
+        st.warning(
+            f"**Overall verdict: ≈ coin-flip** — FA difference "
+            f"({fva_tot:+.1%}) is below your {fva_threshold:.0%} materiality "
+            "threshold."
+        )
+
+    # ---- Breakdown by any column -------------------------------------------
+    st.subheader("Summed-up analysis by…")
+    bd_options = [c for c in all_cols
+                  if c not in {col_ml, col_user, col_act}] 
+    default_bd = col_excl
+    bcol = st.selectbox("Break the scorecard down by", bd_options,
+                        index=bd_options.index(default_bd))
+
+    bg = (
+        dfw.groupby([bcol, col_month], dropna=False)
+           .agg(ml=(col_ml, "sum"), user=(col_user, "sum"),
+                act=(col_act, "sum"))
+           .reset_index()
+    )
+    bg["err_ml"] = (bg["ml"] - bg["act"]).abs()
+    bg["err_user"] = (bg["user"] - bg["act"]).abs()
+    bsum = (
+        bg.groupby(bcol, dropna=False)
+          .agg(act=("act", "sum"), err_ml=("err_ml", "sum"),
+               err_user=("err_user", "sum"))
+          .reset_index()
+    )
+    bsum["wmape_ml"] = np.where(bsum["act"] > 0,
+                                bsum["err_ml"] / bsum["act"], np.nan)
+    bsum["wmape_user"] = np.where(bsum["act"] > 0,
+                                  bsum["err_user"] / bsum["act"], np.nan)
+    bsum["fa_ml"] = (1 - bsum["wmape_ml"]).clip(lower=0)
+    bsum["fa_user"] = (1 - bsum["wmape_user"]).clip(lower=0)
+    bsum["fva"] = bsum["wmape_ml"] - bsum["wmape_user"]
+    bsum["Verdict"] = np.select(
+        [bsum["fva"] >= fva_threshold, bsum["fva"] <= -fva_threshold],
+        ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
+    bsum.loc[bsum["fva"].isna(), "Verdict"] = "⚪ No demand"
+    bsum = bsum.sort_values("act", ascending=False)
+
+    st.dataframe(
+        bsum.rename(columns={
+            bcol: str(bcol), "act": "Shipped units",
+            "err_ml": "Σ |ML − Act|", "err_user": "Σ |User − Act|",
+            "fa_ml": "FA — ML", "fa_user": "FA — User", "fva": "FVA"})
+        [[str(bcol), "Shipped units", "Σ |ML − Act|", "Σ |User − Act|",
+          "FA — ML", "FA — User", "FVA", "Verdict"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "FA — ML": st.column_config.NumberColumn(format="percent"),
+            "FA — User": st.column_config.NumberColumn(format="percent"),
+            "FVA": st.column_config.NumberColumn(
+                format="percent",
+                help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
+            "Shipped units": st.column_config.NumberColumn(format="%,.0f"),
+            "Σ |ML − Act|": st.column_config.NumberColumn(format="%,.0f"),
+            "Σ |User − Act|": st.column_config.NumberColumn(format="%,.0f"),
+        },
+    )
+
+    plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
+    if len(plot_bd) > 1:
+        figb = go.Figure()
+        figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
+                     name="FA — ML", marker_color="#ef4444")
+        figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_user"],
+                     name="FA — User", marker_color="#3b82f6")
+        figb.update_layout(barmode="group", height=420,
+                           yaxis_tickformat=".0%",
+                           yaxis_title="Forecast Accuracy",
+                           xaxis_title=str(bcol),
+                           legend=dict(orientation="h", y=1.1))
+        figb.update_xaxes(categoryorder="array",
+                          categoryarray=plot_bd[bcol].astype(str).tolist())
+        st.plotly_chart(figb, use_container_width=True)
+        st.caption("Top 20 groups by shipped volume.")
 
 with tab_table:
     f1, f2 = st.columns([1, 2])
