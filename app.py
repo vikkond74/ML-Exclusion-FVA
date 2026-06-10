@@ -387,13 +387,8 @@ if n_shadow:
 # -----------------------------------------------------------------------------
 # 7 · Tabs: verdict table · scatter · drill-in
 # -----------------------------------------------------------------------------
-tab_summary, tab_table, tab_scatter, tab_drill = st.tabs(
-    ["📊 Summary", "📋 Verdict table", "📈 ML vs User error map",
-     "🔬 Item drill-in"])
+tab_summary, tab_drill = st.tabs(["📊 Summary", "🔬 Item drill-in"])
 
-display_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
-                             "wmape_user", "user_win_rate", "bias_user",
-                             "bias_ml", "act_sum", "months"]
 
 with tab_summary:
     # ---- Whole-dataset scorecard --------------------------------------------
@@ -411,15 +406,25 @@ with tab_summary:
     fva_tot = (wm_ml_tot - wm_user_tot
                if pd.notna(wm_ml_tot) and pd.notna(wm_user_tot) else np.nan)
 
-    s1, s2, s3, s4, s5 = st.columns(5)
+    bias_ml_tot = (grp_month["ml"].sum() - tot_act) / tot_act if tot_act else np.nan
+    bias_user_tot = (grp_month["user"].sum() - tot_act) / tot_act if tot_act else np.nan
+
+    s1, s2, s3 = st.columns(3)
     s1.metric("Shipped units", f"{tot_act:,.0f}")
     s2.metric("Σ |ML − Actual|", f"{tot_err_ml:,.0f}")
     s3.metric("Σ |User − Actual|", f"{tot_err_user:,.0f}",
               delta=f"{tot_err_ml - tot_err_user:,.0f} vs ML",
               delta_color="normal")
-    s4.metric("Forecast Accuracy — ML", fmt_pct(fa_ml_tot),
+    s4, s5, s6, s7 = st.columns(4)
+    s4.metric("FC Accuracy — ML", fmt_pct(fa_ml_tot),
               help="FA = 1 − WMAPE, floored at 0.")
-    s5.metric("Forecast Accuracy — User", fmt_pct(fa_user_tot))
+    s5.metric("FC Accuracy — User", fmt_pct(fa_user_tot))
+    s6.metric("FC Bias — ML",
+              "—" if pd.isna(bias_ml_tot) else f"{bias_ml_tot:+.1%}",
+              help="(Σ Forecast − Σ Actual) / Σ Actual. Positive = "
+                   "over-forecasting, negative = under-forecasting.")
+    s7.metric("FC Bias — User",
+              "—" if pd.isna(bias_user_tot) else f"{bias_user_tot:+.1%}")
 
     if pd.isna(fva_tot):
         st.info("Not enough shipped volume in the window for an overall verdict.")
@@ -460,10 +465,17 @@ with tab_summary:
     bg["err_user"] = (bg["user"] - bg["act"]).abs()
     bsum = (
         bg.groupby(bcol, dropna=False)
-          .agg(act=("act", "sum"), err_ml=("err_ml", "sum"),
+          .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
+               user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
                err_user=("err_user", "sum"))
           .reset_index()
     )
+    bsum["bias_ml"] = np.where(bsum["act"] > 0,
+                               (bsum["ml_sum"] - bsum["act"]) / bsum["act"],
+                               np.nan)
+    bsum["bias_user"] = np.where(bsum["act"] > 0,
+                                 (bsum["user_sum"] - bsum["act"]) / bsum["act"],
+                                 np.nan)
     bsum["wmape_ml"] = np.where(bsum["act"] > 0,
                                 bsum["err_ml"] / bsum["act"], np.nan)
     bsum["wmape_user"] = np.where(bsum["act"] > 0,
@@ -481,13 +493,20 @@ with tab_summary:
         bsum.rename(columns={
             bcol: str(bcol), "act": "Shipped units",
             "err_ml": "Σ |ML − Act|", "err_user": "Σ |User − Act|",
-            "fa_ml": "FA — ML", "fa_user": "FA — User", "fva": "FVA"})
+            "fa_ml": "FC Acc — ML", "fa_user": "FC Acc — User",
+            "bias_ml": "FC Bias — ML", "bias_user": "FC Bias — User",
+            "fva": "FVA"})
         [[str(bcol), "Shipped units", "Σ |ML − Act|", "Σ |User − Act|",
-          "FA — ML", "FA — User", "FVA", "Verdict"]],
+          "FC Acc — ML", "FC Acc — User", "FC Bias — ML", "FC Bias — User",
+          "FVA", "Verdict"]],
         use_container_width=True, hide_index=True,
         column_config={
-            "FA — ML": st.column_config.NumberColumn(format="percent"),
-            "FA — User": st.column_config.NumberColumn(format="percent"),
+            "FC Acc — ML": st.column_config.NumberColumn(format="percent"),
+            "FC Acc — User": st.column_config.NumberColumn(format="percent"),
+            "FC Bias — ML": st.column_config.NumberColumn(
+                format="percent",
+                help="Positive = over-forecast, negative = under-forecast."),
+            "FC Bias — User": st.column_config.NumberColumn(format="percent"),
             "FVA": st.column_config.NumberColumn(
                 format="percent",
                 help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
@@ -501,9 +520,9 @@ with tab_summary:
     if len(plot_bd) > 1:
         figb = go.Figure()
         figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
-                     name="FA — ML", marker_color="#ef4444")
+                     name="FC Acc — ML", marker_color="#ef4444")
         figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_user"],
-                     name="FA — User", marker_color="#3b82f6")
+                     name="FC Acc — User", marker_color="#3b82f6")
         figb.update_layout(barmode="group", height=420,
                            yaxis_tickformat=".0%",
                            yaxis_title="Forecast Accuracy",
@@ -514,81 +533,14 @@ with tab_summary:
         st.plotly_chart(figb, use_container_width=True)
         st.caption("Top 20 groups by shipped volume.")
 
-with tab_table:
-    f1, f2 = st.columns([1, 2])
-    flag_filter = f1.multiselect("Exclusion flag", ["Y", "N", "Mixed"],
-                                 default=["Y"])
-    verdict_filter = f2.multiselect(
-        "Verdict", sorted(item["verdict"].unique().tolist()), default=[])
-    tbl = item[item["excl"].isin(flag_filter)] if flag_filter else item
-    if verdict_filter:
-        tbl = tbl[tbl["verdict"].isin(verdict_filter)]
-    tbl = tbl.sort_values("fva")  # worst exclusions first
-    if tbl.empty:
-        st.info(
-            "No rows match the current filters. If 'Excluded items' shows 0 "
-            "above, either this extract truly has no exclusions or the "
-            "exclusion-flag column is mis-mapped (check the sidebar). "
-            "Otherwise, add 'N' to the Exclusion flag filter to see "
-            "non-excluded items."
-        )
-    st.dataframe(
-        tbl[display_cols].rename(columns={
-            "excl": "Excluded", "verdict": "Verdict", "fva": "FVA",
-            "wmape_ml": "WMAPE ML", "wmape_user": "WMAPE User",
-            "user_win_rate": "User win rate", "bias_user": "Bias user",
-            "bias_ml": "Bias ML", "act_sum": "Shipped units",
-            "months": "Months"}),
-        use_container_width=True, height=480,
-        column_config={
-            "FVA": st.column_config.NumberColumn(
-                format="percent",
-                help="WMAPE(ML) − WMAPE(User). Positive = human adds value."),
-            "WMAPE ML": st.column_config.NumberColumn(format="percent"),
-            "WMAPE User": st.column_config.NumberColumn(format="percent"),
-            "User win rate": st.column_config.NumberColumn(format="percent"),
-            "Bias user": st.column_config.NumberColumn(format="percent"),
-            "Bias ML": st.column_config.NumberColumn(format="percent"),
-        },
-    )
-    csv = tbl[display_cols].to_csv(index=False).encode()
-    st.download_button("⬇️ Download verdict table (CSV)", csv,
-                       "exclusion_verdicts.csv", "text/csv")
-
-with tab_scatter:
-    plot_df = item[(item["act_sum"] >= max(min_volume, 1)) &
-                   item["wmape_ml"].notna() & item["wmape_user"].notna()].copy()
-    if plot_df.empty:
-        st.info("Nothing to plot at the current volume floor.")
-    else:
-        cap = st.slider("Cap WMAPE axis at", 0.5, 5.0, 2.0, 0.5)
-        plot_df["wmape_ml_c"] = plot_df["wmape_ml"].clip(upper=cap)
-        plot_df["wmape_user_c"] = plot_df["wmape_user"].clip(upper=cap)
-        plot_df["label"] = make_label(plot_df, level_cols)
-        fig = px.scatter(
-            plot_df, x="wmape_ml_c", y="wmape_user_c", color="excl",
-            size="act_sum", size_max=28, hover_name="label",
-            hover_data={"fva": ":.0%", "user_win_rate": ":.0%",
-                        "wmape_ml_c": False, "wmape_user_c": False},
-            color_discrete_map={"Y": "#ef4444", "N": "#3b82f6",
-                                "Mixed": "#a855f7"},
-            labels={"wmape_ml_c": "WMAPE — ML forecast",
-                    "wmape_user_c": "WMAPE — user forecast",
-                    "excl": "Excluded"},
-        )
-        fig.add_shape(type="line", x0=0, y0=0, x1=cap, y1=cap,
-                      line=dict(dash="dash", color="grey"))
-        fig.add_annotation(x=cap * 0.78, y=cap * 0.94, showarrow=False,
-                           text="Above line: ML wins → exclusion suspect",
-                           font=dict(size=11, color="grey"))
-        fig.add_annotation(x=cap * 0.22, y=cap * 0.04, showarrow=False,
-                           text="Below line: human wins → exclusion justified",
-                           font=dict(size=11, color="grey"))
-        fig.update_layout(height=620)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Bubble size = shipped volume. Red bubbles **above** the "
-                   "diagonal are excluded items where ML would have been more "
-                   "accurate — the prime removal candidates.")
+    export_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
+                                "wmape_user", "user_win_rate", "bias_user",
+                                "bias_ml", "act_sum", "months"]
+    st.download_button(
+        "⬇️ Download item-level verdicts (CSV)",
+        item.sort_values("fva")[export_cols].to_csv(index=False).encode(),
+        "exclusion_verdicts.csv", "text/csv",
+        help="Full per-item verdict table at the chosen analysis level.")
 
 with tab_drill:
     item["_label"] = make_label(item, level_cols)
