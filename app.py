@@ -447,16 +447,21 @@ with tab_summary:
             "threshold."
         )
 
-    # ---- Breakdown by any column -------------------------------------------
+    # ---- Breakdown by any column, split by exclusion flag --------------------
     st.subheader("Summed-up analysis by…")
     bd_options = [c for c in all_cols
-                  if c not in {col_ml, col_user, col_act}] 
+                  if c not in {col_ml, col_user, col_act}]
     default_bd = col_excl
     bcol = st.selectbox("Break the scorecard down by", bd_options,
                         index=bd_options.index(default_bd))
 
+    # Group by the chosen column AND the exclusion flag, so both sides
+    # (excluded Y vs not-excluded N) are visible within every group.
+    split_by_excl = bcol != col_excl
+    keys = [bcol, "_excl"] if split_by_excl else [bcol]
+
     bg = (
-        dfw.groupby([bcol, col_month], dropna=False)
+        dfw.groupby(keys + [col_month], dropna=False)
            .agg(ml=(col_ml, "sum"), user=(col_user, "sum"),
                 act=(col_act, "sum"))
            .reset_index()
@@ -464,7 +469,7 @@ with tab_summary:
     bg["err_ml"] = (bg["ml"] - bg["act"]).abs()
     bg["err_user"] = (bg["user"] - bg["act"]).abs()
     bsum = (
-        bg.groupby(bcol, dropna=False)
+        bg.groupby(keys, dropna=False)
           .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
                user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
                err_user=("err_user", "sum"))
@@ -487,18 +492,27 @@ with tab_summary:
         [bsum["fva"] >= fva_threshold, bsum["fva"] <= -fva_threshold],
         ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
     bsum.loc[bsum["fva"].isna(), "Verdict"] = "⚪ No demand"
-    bsum = bsum.sort_values("act", ascending=False)
+    # Sort: biggest groups first, Y before N within each group
+    if split_by_excl:
+        vol_order = (bsum.groupby(bcol)["act"].sum()
+                         .sort_values(ascending=False).index.tolist())
+        bsum["_vol_rank"] = bsum[bcol].map({v: i for i, v in enumerate(vol_order)})
+        bsum = bsum.sort_values(["_vol_rank", "_excl"],
+                                ascending=[True, False]).drop(columns="_vol_rank")
+    else:
+        bsum = bsum.sort_values("act", ascending=False)
 
+    show_cols = [str(bcol)] + (["Excluded"] if split_by_excl else []) + [
+        "Shipped units", "Σ |ML − Act|", "Σ |User − Act|",
+        "FC Acc — ML", "FC Acc — User", "FC Bias — ML", "FC Bias — User",
+        "FVA", "Verdict"]
     st.dataframe(
         bsum.rename(columns={
-            bcol: str(bcol), "act": "Shipped units",
+            bcol: str(bcol), "_excl": "Excluded", "act": "Shipped units",
             "err_ml": "Σ |ML − Act|", "err_user": "Σ |User − Act|",
             "fa_ml": "FC Acc — ML", "fa_user": "FC Acc — User",
             "bias_ml": "FC Bias — ML", "bias_user": "FC Bias — User",
-            "fva": "FVA"})
-        [[str(bcol), "Shipped units", "Σ |ML − Act|", "Σ |User − Act|",
-          "FC Acc — ML", "FC Acc — User", "FC Bias — ML", "FC Bias — User",
-          "FVA", "Verdict"]],
+            "fva": "FVA"})[show_cols],
         use_container_width=True, hide_index=True,
         column_config={
             "FC Acc — ML": st.column_config.NumberColumn(format="percent"),
@@ -516,22 +530,51 @@ with tab_summary:
         },
     )
 
-    plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
-    if len(plot_bd) > 1:
-        figb = go.Figure()
-        figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
-                     name="FC Acc — ML", marker_color="#ef4444")
-        figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_user"],
-                     name="FC Acc — User", marker_color="#3b82f6")
-        figb.update_layout(barmode="group", height=420,
-                           yaxis_tickformat=".0%",
-                           yaxis_title="Forecast Accuracy",
-                           xaxis_title=str(bcol),
-                           legend=dict(orientation="h", y=1.1))
-        figb.update_xaxes(categoryorder="array",
-                          categoryarray=plot_bd[bcol].astype(str).tolist())
-        st.plotly_chart(figb, use_container_width=True)
-        st.caption("Top 20 groups by shipped volume.")
+    if split_by_excl:
+        top_groups = (bsum.groupby(bcol)["act"].sum()
+                          .sort_values(ascending=False).head(12).index.tolist())
+        plot_bd = bsum[bsum[bcol].isin(top_groups) & bsum["fa_ml"].notna()]
+        if not plot_bd.empty:
+            long = plot_bd.melt(
+                id_vars=[bcol, "_excl"], value_vars=["fa_ml", "fa_user"],
+                var_name="side", value_name="fa")
+            long["side"] = long["side"].map({"fa_ml": "FC Acc — ML",
+                                             "fa_user": "FC Acc — User"})
+            figb = px.bar(
+                long, x=bcol, y="fa", color="side", barmode="group",
+                facet_col="_excl",
+                color_discrete_map={"FC Acc — ML": "#ef4444",
+                                    "FC Acc — User": "#3b82f6"},
+                category_orders={bcol: [str(g) for g in top_groups],
+                                 "_excl": ["Y", "N", "Mixed"]},
+                labels={"fa": "Forecast Accuracy", "side": ""},
+            )
+            figb.for_each_annotation(lambda a: a.update(
+                text="Excluded (Y)" if a.text.endswith("Y")
+                else ("Not excluded (N)" if a.text.endswith("N") else a.text)))
+            figb.update_layout(height=440, yaxis_tickformat=".0%",
+                               legend=dict(orientation="h", y=1.12))
+            figb.update_yaxes(tickformat=".0%")
+            st.plotly_chart(figb, use_container_width=True)
+            st.caption("Top 12 groups by shipped volume, split into excluded "
+                       "(Y) and not-excluded (N) items.")
+    else:
+        plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
+        if len(plot_bd) > 1:
+            figb = go.Figure()
+            figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
+                         name="FC Acc — ML", marker_color="#ef4444")
+            figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_user"],
+                         name="FC Acc — User", marker_color="#3b82f6")
+            figb.update_layout(barmode="group", height=420,
+                               yaxis_tickformat=".0%",
+                               yaxis_title="Forecast Accuracy",
+                               xaxis_title=str(bcol),
+                               legend=dict(orientation="h", y=1.1))
+            figb.update_xaxes(categoryorder="array",
+                              categoryarray=plot_bd[bcol].astype(str).tolist())
+            st.plotly_chart(figb, use_container_width=True)
+            st.caption("Top 20 groups by shipped volume.")
 
     export_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
                                 "wmape_user", "user_win_rate", "bias_user",
