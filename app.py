@@ -391,60 +391,86 @@ tab_summary, tab_drill = st.tabs(["📊 Summary", "🔬 Item drill-in"])
 
 
 with tab_summary:
-    # ---- Whole-dataset scorecard --------------------------------------------
+    # ---- Whole-dataset scorecard, split by exclusion flag --------------------
     st.subheader("Whole-dataset scorecard")
     st.caption("Errors computed at the chosen analysis level per month, then "
-               "summed over the window — last 12 months max.")
+               "summed over the window — last 12 months max. Split into "
+               "excluded (Y) and not-excluded (N) items.")
 
-    tot_act = grp_month["act"].sum()
-    tot_err_ml = grp_month["err_ml"].sum()
-    tot_err_user = grp_month["err_user"].sum()
-    wm_ml_tot = wmape(tot_err_ml, tot_act)
-    wm_user_tot = wmape(tot_err_user, tot_act)
-    fa_ml_tot = np.nan if pd.isna(wm_ml_tot) else max(0.0, 1 - wm_ml_tot)
-    fa_user_tot = np.nan if pd.isna(wm_user_tot) else max(0.0, 1 - wm_user_tot)
-    fva_tot = (wm_ml_tot - wm_user_tot
-               if pd.notna(wm_ml_tot) and pd.notna(wm_user_tot) else np.nan)
+    def scorecard_row(label, frame):
+        a = frame["act"].sum()
+        em = frame["err_ml"].sum()
+        eu = frame["err_user"].sum()
+        wm_ml = wmape(em, a)
+        wm_user = wmape(eu, a)
+        return {
+            "Scope": label,
+            "Shipped units": a,
+            "Σ |ML − Act|": em,
+            "Σ |User − Act|": eu,
+            "FC Acc — ML": np.nan if pd.isna(wm_ml) else max(0.0, 1 - wm_ml),
+            "FC Acc — User": np.nan if pd.isna(wm_user) else max(0.0, 1 - wm_user),
+            "FC Bias — ML": (frame["ml"].sum() - a) / a if a else np.nan,
+            "FC Bias — User": (frame["user"].sum() - a) / a if a else np.nan,
+            "FVA": (wm_ml - wm_user
+                    if pd.notna(wm_ml) and pd.notna(wm_user) else np.nan),
+        }
 
-    bias_ml_tot = (grp_month["ml"].sum() - tot_act) / tot_act if tot_act else np.nan
-    bias_user_tot = (grp_month["user"].sum() - tot_act) / tot_act if tot_act else np.nan
+    rows = [scorecard_row("All items", grp_month),
+            scorecard_row("Excluded (Y)", grp_month[grp_month["excl"] == "Y"]),
+            scorecard_row("Not excluded (N)", grp_month[grp_month["excl"] == "N"])]
+    if (grp_month["excl"] == "Mixed").any():
+        rows.append(scorecard_row("Mixed flag", grp_month[grp_month["excl"] == "Mixed"]))
+    sc = pd.DataFrame(rows)
+    sc["Verdict"] = np.select(
+        [sc["FVA"] >= fva_threshold, sc["FVA"] <= -fva_threshold],
+        ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
+    sc.loc[sc["FVA"].isna(), "Verdict"] = "⚪ No demand"
 
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Shipped units", f"{tot_act:,.0f}")
-    s2.metric("Σ |ML − Actual|", f"{tot_err_ml:,.0f}")
-    s3.metric("Σ |User − Actual|", f"{tot_err_user:,.0f}",
-              delta=f"{tot_err_ml - tot_err_user:,.0f} vs ML",
-              delta_color="normal")
-    s4, s5, s6, s7 = st.columns(4)
-    s4.metric("FC Accuracy — ML", fmt_pct(fa_ml_tot),
-              help="FA = 1 − WMAPE, floored at 0.")
-    s5.metric("FC Accuracy — User", fmt_pct(fa_user_tot))
-    s6.metric("FC Bias — ML",
-              "—" if pd.isna(bias_ml_tot) else f"{bias_ml_tot:+.1%}",
-              help="(Σ Forecast − Σ Actual) / Σ Actual. Positive = "
-                   "over-forecasting, negative = under-forecasting.")
-    s7.metric("FC Bias — User",
-              "—" if pd.isna(bias_user_tot) else f"{bias_user_tot:+.1%}")
+    st.dataframe(
+        sc, use_container_width=True, hide_index=True,
+        column_config={
+            "FC Acc — ML": st.column_config.NumberColumn(
+                format="percent", help="FA = 1 − WMAPE, floored at 0."),
+            "FC Acc — User": st.column_config.NumberColumn(format="percent"),
+            "FC Bias — ML": st.column_config.NumberColumn(
+                format="percent",
+                help="(Σ Forecast − Σ Actual) / Σ Actual. Positive = "
+                     "over-forecast, negative = under-forecast."),
+            "FC Bias — User": st.column_config.NumberColumn(format="percent"),
+            "FVA": st.column_config.NumberColumn(
+                format="percent",
+                help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
+            "Shipped units": st.column_config.NumberColumn(format="%,.0f"),
+            "Σ |ML − Act|": st.column_config.NumberColumn(format="%,.0f"),
+            "Σ |User − Act|": st.column_config.NumberColumn(format="%,.0f"),
+        },
+    )
 
-    if pd.isna(fva_tot):
-        st.info("Not enough shipped volume in the window for an overall verdict.")
-    elif fva_tot >= fva_threshold:
+    # One headline verdict, focused on the side the tool exists to judge
+    y_row = sc[sc["Scope"] == "Excluded (Y)"].iloc[0]
+    if pd.isna(y_row["FVA"]):
+        st.info("No shipped volume on excluded items in the window — no "
+                "verdict on the exclusion list as a whole.")
+    elif y_row["FVA"] >= fva_threshold:
         st.success(
-            f"**Overall verdict: 👤 the user forecast adds value** — "
-            f"FA {fmt_pct(fa_user_tot)} vs {fmt_pct(fa_ml_tot)} for ML "
-            f"(FVA {fva_tot:+.0%})."
+            f"**Excluded items overall: 👤 the user forecast adds value** — "
+            f"FC Acc {y_row['FC Acc — User']:.0%} vs {y_row['FC Acc — ML']:.0%} "
+            f"for ML (FVA {y_row['FVA']:+.0%}). The exclusion list is earning "
+            "its keep in aggregate; use the drill-in for item exceptions."
         )
-    elif fva_tot <= -fva_threshold:
+    elif y_row["FVA"] <= -fva_threshold:
         st.error(
-            f"**Overall verdict: 🤖 ML would be more accurate** — "
-            f"FA {fmt_pct(fa_ml_tot)} vs {fmt_pct(fa_user_tot)} for the user "
-            f"forecast (FVA {fva_tot:+.0%})."
+            f"**Excluded items overall: 🤖 ML would be more accurate** — "
+            f"FC Acc {y_row['FC Acc — ML']:.0%} vs {y_row['FC Acc — User']:.0%} "
+            f"for the user forecast (FVA {y_row['FVA']:+.0%}). The exclusion "
+            "list as a whole is destroying forecast value — review it."
         )
     else:
         st.warning(
-            f"**Overall verdict: ≈ coin-flip** — FA difference "
-            f"({fva_tot:+.1%}) is below your {fva_threshold:.0%} materiality "
-            "threshold."
+            f"**Excluded items overall: ≈ coin-flip** — FA difference "
+            f"({y_row['FVA']:+.1%}) is below your {fva_threshold:.0%} "
+            "materiality threshold."
         )
 
     # ---- Breakdown by any column, split by exclusion flag --------------------
