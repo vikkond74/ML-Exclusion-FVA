@@ -538,134 +538,177 @@ with tab_summary:
             "materiality threshold."
         )
 
-    # ---- Breakdown by any column, split by exclusion flag --------------------
+    # ---- Breakdown by any column ---------------------------------------------
     st.subheader("Summed-up analysis by…")
-    bd_options = [c for c in all_cols
-                  if c not in {col_ml, col_user, col_act}]
-    default_bd = col_excl
-    bcol = st.selectbox("Break the scorecard down by", bd_options,
-                        index=bd_options.index(default_bd))
 
-    # Group by the chosen column AND the exclusion flag, so both sides
-    # (excluded Y vs not-excluded N) are visible within every group.
-    split_by_excl = bcol != col_excl
-    keys = [bcol, "_excl"] if split_by_excl else [bcol]
+    cset1, cset2 = st.columns([1.6, 2.4])
+    with cset1:
+        bd_options = [c for c in all_cols
+                      if c not in {col_ml, col_user, col_act, col_month}]
+        default_bd = col_excl
+        bcol = st.selectbox("Break the scorecard down by", bd_options,
+                            index=bd_options.index(default_bd))
+        excl_scope = st.radio("ML exclusion scope",
+                              ["Both (split Y/N)", "Y only", "N only"],
+                              horizontal=True)
+    with cset2:
+        _pp = parse_periods(months_sorted)
+        if _pp is not None:
+            _ymap = {v: (d.year if pd.notna(d) else None)
+                     for v, d in zip(months_sorted, _pp)}
+            _years = sorted({y for y in _ymap.values() if y is not None})
+            sel_years = st.multiselect("Years", _years, default=_years)
+            period_opts = [m for m in months_sorted
+                           if _ymap.get(m) in set(sel_years)]
+        else:
+            period_opts = months_sorted
+        sel_periods = st.multiselect("Months / periods", period_opts,
+                                     default=period_opts)
 
-    bg = (
-        dfw.groupby(keys + [col_month], dropna=False)
-           .agg(ml=(col_ml, "sum"), user=(col_user, "sum"),
-                act=(col_act, "sum"))
-           .reset_index()
-    )
-    bg["err_ml"] = (bg["ml"] - bg["act"]).abs()
-    bg["err_user"] = (bg["user"] - bg["act"]).abs()
-    bsum = (
-        bg.groupby(keys, dropna=False)
-          .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
-               user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
-               err_user=("err_user", "sum"))
-          .reset_index()
-    )
-    bsum["bias_ml"] = np.where(bsum["act"] > 0,
-                               (bsum["ml_sum"] - bsum["act"]) / bsum["act"],
-                               np.nan)
-    bsum["bias_user"] = np.where(bsum["act"] > 0,
-                                 (bsum["user_sum"] - bsum["act"]) / bsum["act"],
-                                 np.nan)
-    bsum["wmape_ml"] = np.where(bsum["act"] > 0,
-                                bsum["err_ml"] / bsum["act"], np.nan)
-    bsum["wmape_user"] = np.where(bsum["act"] > 0,
-                                  bsum["err_user"] / bsum["act"], np.nan)
-    bsum["fa_ml"] = (1 - bsum["wmape_ml"]).clip(lower=0)
-    bsum["fa_user"] = (1 - bsum["wmape_user"]).clip(lower=0)
-    bsum["fva"] = bsum["wmape_ml"] - bsum["wmape_user"]
-    bsum["Verdict"] = np.select(
-        [bsum["fva"] >= fva_threshold, bsum["fva"] <= -fva_threshold],
-        ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
-    bsum.loc[bsum["fva"].isna(), "Verdict"] = "⚪ No demand"
-    # Sort: biggest groups first, Y before N within each group
-    if split_by_excl:
-        vol_order = (bsum.groupby(bcol)["act"].sum()
-                         .sort_values(ascending=False).index.tolist())
-        bsum["_vol_rank"] = bsum[bcol].map({v: i for i, v in enumerate(vol_order)})
-        bsum = bsum.sort_values(["_vol_rank", "_excl"],
-                                ascending=[True, False]).drop(columns="_vol_rank")
+    if not sel_periods:
+        st.info("Select at least one period to see the summed-up analysis.")
     else:
-        bsum = bsum.sort_values("act", ascending=False)
+        dfb = df[df[col_month].isin(sel_periods)]
+        if excl_scope == "Y only":
+            dfb = dfb[dfb["_excl"] == "Y"]
+        elif excl_scope == "N only":
+            dfb = dfb[dfb["_excl"] == "N"]
+        split_by_excl = excl_scope.startswith("Both") and bcol != col_excl
+        keys = [bcol, "_excl"] if split_by_excl else [bcol]
 
-    show_cols = [str(bcol)] + (["Excluded"] if split_by_excl else []) + [
-        "Shipped units", "Σ |ML − Act|", "Σ |User − Act|",
-        "FC Acc — ML", "FC Acc — User", "FC Bias — ML", "FC Bias — User",
-        "FVA", "Verdict"]
-    st.dataframe(
-        bsum.rename(columns={
-            bcol: str(bcol), "_excl": "Excluded", "act": "Shipped units",
-            "err_ml": "Σ |ML − Act|", "err_user": "Σ |User − Act|",
-            "fa_ml": "FC Acc — ML", "fa_user": "FC Acc — User",
-            "bias_ml": "FC Bias — ML", "bias_user": "FC Bias — User",
-            "fva": "FVA"})[show_cols],
-        use_container_width=True, hide_index=True,
-        column_config={
-            "FC Acc — ML": st.column_config.NumberColumn(format="percent"),
-            "FC Acc — User": st.column_config.NumberColumn(format="percent"),
-            "FC Bias — ML": st.column_config.NumberColumn(
-                format="percent",
-                help="Positive = over-forecast, negative = under-forecast."),
-            "FC Bias — User": st.column_config.NumberColumn(format="percent"),
-            "FVA": st.column_config.NumberColumn(
-                format="percent",
-                help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
-            "Shipped units": st.column_config.NumberColumn(format="%,.0f"),
-            "Σ |ML − Act|": st.column_config.NumberColumn(format="%,.0f"),
-            "Σ |User − Act|": st.column_config.NumberColumn(format="%,.0f"),
-        },
-    )
+        if dfb.empty:
+            st.warning("No rows match the selected periods and exclusion scope.")
+            st.stop()
 
-    if split_by_excl:
-        top_groups = (bsum.groupby(bcol)["act"].sum()
-                          .sort_values(ascending=False).head(12).index.tolist())
-        plot_bd = bsum[bsum[bcol].isin(top_groups) & bsum["fa_ml"].notna()]
-        if not plot_bd.empty:
-            long = plot_bd.melt(
-                id_vars=[bcol, "_excl"], value_vars=["fa_ml", "fa_user"],
-                var_name="side", value_name="fa")
-            long["side"] = long["side"].map({"fa_ml": "FC Acc — ML",
-                                             "fa_user": "FC Acc — User"})
-            figb = px.bar(
-                long, x=bcol, y="fa", color="side", barmode="group",
-                facet_col="_excl",
-                color_discrete_map={"FC Acc — ML": "#ef4444",
-                                    "FC Acc — User": "#3b82f6"},
-                category_orders={bcol: [str(g) for g in top_groups],
-                                 "_excl": ["Y", "N", "Mixed"]},
-                labels={"fa": "Forecast Accuracy", "side": ""},
-            )
-            figb.for_each_annotation(lambda a: a.update(
-                text="Excluded (Y)" if a.text.endswith("Y")
-                else ("Not excluded (N)" if a.text.endswith("N") else a.text)))
-            figb.update_layout(height=440, yaxis_tickformat=".0%",
-                               legend=dict(orientation="h", y=1.12))
-            figb.update_yaxes(tickformat=".0%")
-            st.plotly_chart(figb, use_container_width=True)
-            st.caption("Top 12 groups by shipped volume, split into excluded "
-                       "(Y) and not-excluded (N) items.")
-    else:
-        plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
-        if len(plot_bd) > 1:
-            figb = go.Figure()
-            figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
-                         name="FC Acc — ML", marker_color="#ef4444")
-            figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_user"],
-                         name="FC Acc — User", marker_color="#3b82f6")
-            figb.update_layout(barmode="group", height=420,
-                               yaxis_tickformat=".0%",
-                               yaxis_title="Forecast Accuracy",
-                               xaxis_title=str(bcol),
-                               legend=dict(orientation="h", y=1.1))
-            figb.update_xaxes(categoryorder="array",
-                              categoryarray=plot_bd[bcol].astype(str).tolist())
-            st.plotly_chart(figb, use_container_width=True)
-            st.caption("Top 20 groups by shipped volume.")
+        bg = (
+            dfb.groupby(keys + [col_month], dropna=False)
+               .agg(ml=(col_ml, "sum"), user=(col_user, "sum"),
+                    act=(col_act, "sum"))
+               .reset_index()
+        )
+        bg["err_ml"] = (bg["ml"] - bg["act"]).abs()
+        bg["err_user"] = (bg["user"] - bg["act"]).abs()
+        bsum = (
+            bg.groupby(keys, dropna=False)
+              .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
+                   user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
+                   err_user=("err_user", "sum"))
+              .reset_index()
+        )
+        bsum["bias_ml"] = np.where(bsum["act"] > 0,
+                                   (bsum["ml_sum"] - bsum["act"]) / bsum["act"],
+                                   np.nan)
+        bsum["bias_user"] = np.where(bsum["act"] > 0,
+                                     (bsum["user_sum"] - bsum["act"]) / bsum["act"],
+                                     np.nan)
+        bsum["wmape_ml"] = np.where(bsum["act"] > 0,
+                                    bsum["err_ml"] / bsum["act"], np.nan)
+        bsum["wmape_user"] = np.where(bsum["act"] > 0,
+                                      bsum["err_user"] / bsum["act"], np.nan)
+        bsum["fa_ml"] = (1 - bsum["wmape_ml"]).clip(lower=0)
+        bsum["fa_user"] = (1 - bsum["wmape_user"]).clip(lower=0)
+        bsum["fva"] = bsum["wmape_ml"] - bsum["wmape_user"]
+        bsum["Verdict"] = np.select(
+            [bsum["fva"] >= fva_threshold, bsum["fva"] <= -fva_threshold],
+            ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
+        bsum.loc[bsum["fva"].isna(), "Verdict"] = "⚪ No demand"
+
+        if split_by_excl:
+            vol_order = (bsum.groupby(bcol)["act"].sum()
+                             .sort_values(ascending=False).index.tolist())
+            bsum["_vol_rank"] = bsum[bcol].map(
+                {v: i for i, v in enumerate(vol_order)})
+            bsum = bsum.sort_values(["_vol_rank", "_excl"],
+                                    ascending=[True, False]).drop(
+                                        columns="_vol_rank")
+        else:
+            bsum = bsum.sort_values("act", ascending=False)
+
+        st.caption(f"Scope: **{excl_scope}** · {len(sel_periods)} period(s): "
+                   f"{', '.join(str(p) for p in sel_periods[:6])}"
+                   f"{'…' if len(sel_periods) > 6 else ''}")
+
+        show_cols = [str(bcol)] + (["Excluded"] if split_by_excl else []) + [
+            "ML FC", "User FC", "Shipped units", "Σ |ML − Act|",
+            "Σ |User − Act|", "FC Acc — ML", "FC Acc — User",
+            "FC Bias — ML", "FC Bias — User", "FVA", "Verdict"]
+        st.dataframe(
+            bsum.rename(columns={
+                bcol: str(bcol), "_excl": "Excluded",
+                "ml_sum": "ML FC", "user_sum": "User FC",
+                "act": "Shipped units",
+                "err_ml": "Σ |ML − Act|", "err_user": "Σ |User − Act|",
+                "fa_ml": "FC Acc — ML", "fa_user": "FC Acc — User",
+                "bias_ml": "FC Bias — ML", "bias_user": "FC Bias — User",
+                "fva": "FVA"})[show_cols],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "FC Acc — ML": st.column_config.NumberColumn(format="percent"),
+                "FC Acc — User": st.column_config.NumberColumn(format="percent"),
+                "FC Bias — ML": st.column_config.NumberColumn(
+                    format="percent",
+                    help="Positive = over-forecast, negative = under-forecast."),
+                "FC Bias — User": st.column_config.NumberColumn(format="percent"),
+                "FVA": st.column_config.NumberColumn(
+                    format="percent",
+                    help="WMAPE(ML) − WMAPE(User); positive = user adds value."),
+                "ML FC": st.column_config.NumberColumn(format="%,.0f"),
+                "User FC": st.column_config.NumberColumn(format="%,.0f"),
+                "Shipped units": st.column_config.NumberColumn(format="%,.0f"),
+                "Σ |ML − Act|": st.column_config.NumberColumn(format="%,.0f"),
+                "Σ |User − Act|": st.column_config.NumberColumn(format="%,.0f"),
+            },
+        )
+
+        if split_by_excl:
+            top_groups = (bsum.groupby(bcol)["act"].sum()
+                              .sort_values(ascending=False).head(12)
+                              .index.tolist())
+            plot_bd = bsum[bsum[bcol].isin(top_groups) & bsum["fa_ml"].notna()]
+            if not plot_bd.empty:
+                long = plot_bd.melt(
+                    id_vars=[bcol, "_excl"], value_vars=["fa_ml", "fa_user"],
+                    var_name="side", value_name="fa")
+                long["side"] = long["side"].map({"fa_ml": "FC Acc — ML",
+                                                 "fa_user": "FC Acc — User"})
+                figb = px.bar(
+                    long, x=bcol, y="fa", color="side", barmode="group",
+                    facet_col="_excl",
+                    color_discrete_map={"FC Acc — ML": "#ef4444",
+                                        "FC Acc — User": "#3b82f6"},
+                    category_orders={bcol: [str(g) for g in top_groups],
+                                     "_excl": ["Y", "N", "Mixed"]},
+                    labels={"fa": "Forecast Accuracy", "side": ""},
+                )
+                figb.for_each_annotation(lambda a: a.update(
+                    text="Excluded (Y)" if a.text.endswith("Y")
+                    else ("Not excluded (N)" if a.text.endswith("N")
+                          else a.text)))
+                figb.update_layout(height=440, yaxis_tickformat=".0%",
+                                   legend=dict(orientation="h", y=1.12))
+                figb.update_yaxes(tickformat=".0%")
+                st.plotly_chart(figb, use_container_width=True)
+                st.caption("Top 12 groups by shipped volume, split into "
+                           "excluded (Y) and not-excluded (N) items.")
+        else:
+            plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
+            if len(plot_bd) > 1:
+                figb = go.Figure()
+                figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
+                             name="FC Acc — ML", marker_color="#ef4444")
+                figb.add_bar(x=plot_bd[bcol].astype(str),
+                             y=plot_bd["fa_user"],
+                             name="FC Acc — User", marker_color="#3b82f6")
+                figb.update_layout(barmode="group", height=420,
+                                   yaxis_tickformat=".0%",
+                                   yaxis_title="Forecast Accuracy",
+                                   xaxis_title=str(bcol),
+                                   legend=dict(orientation="h", y=1.1))
+                figb.update_xaxes(
+                    categoryorder="array",
+                    categoryarray=plot_bd[bcol].astype(str).tolist())
+                st.plotly_chart(figb, use_container_width=True)
+                st.caption("Top 20 groups by shipped volume.")
 
     export_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
                                 "wmape_user", "user_win_rate", "bias_user",
