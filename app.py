@@ -80,6 +80,14 @@ def fmt_pct(x):
     return "—" if pd.isna(x) else f"{x:0.0%}"
 
 
+def make_label(frame, cols):
+    """Concatenate dimension columns into one display label (version-proof)."""
+    lbl = frame[cols[0]].astype(str)
+    for c in cols[1:]:
+        lbl = lbl + " | " + frame[c].astype(str)
+    return lbl
+
+
 # -----------------------------------------------------------------------------
 # 1 · Upload
 # -----------------------------------------------------------------------------
@@ -353,7 +361,7 @@ with tab_scatter:
         cap = st.slider("Cap WMAPE axis at", 0.5, 5.0, 2.0, 0.5)
         plot_df["wmape_ml_c"] = plot_df["wmape_ml"].clip(upper=cap)
         plot_df["wmape_user_c"] = plot_df["wmape_user"].clip(upper=cap)
-        plot_df["label"] = plot_df[level_cols].astype(str).agg(" | ".join, axis=1)
+        plot_df["label"] = make_label(plot_df, level_cols)
         fig = px.scatter(
             plot_df, x="wmape_ml_c", y="wmape_user_c", color="excl",
             size="act_sum", size_max=28, hover_name="label",
@@ -380,7 +388,7 @@ with tab_scatter:
                    "accurate — the prime removal candidates.")
 
 with tab_drill:
-    item["_label"] = item[level_cols].astype(str).agg(" | ".join, axis=1)
+    item["_label"] = make_label(item, level_cols)
     order = item.sort_values("fva")["_label"].tolist()
     pick = st.selectbox("Pick an item (sorted worst FVA first)", order)
     sel_row = item[item["_label"] == pick].iloc[0]
