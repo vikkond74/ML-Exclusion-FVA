@@ -220,6 +220,63 @@ if not level_cols:
 # 3 · Settings
 # -----------------------------------------------------------------------------
 st.sidebar.header("3 · Verdict settings")
+
+# ---- Completed months only: drop the current month and anything beyond ------
+def parse_periods(vals):
+    """Try to interpret period values as calendar months. Returns parsed
+    datetimes aligned to vals, or None if the values carry no calendar info
+    (e.g. relative period numbers 1..12)."""
+    s = pd.Series(list(vals))
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().all():
+        if num.between(1, 600).all():
+            return None  # relative period numbering, no calendar anchor
+        if num.between(190001, 209912).all():  # YYYYMM
+            return pd.to_datetime(num.astype(int).astype(str), format="%Y%m",
+                                  errors="coerce")
+    try:
+        parsed = pd.to_datetime(s.astype(str), format="mixed",
+                                dayfirst=True, errors="coerce")
+    except (TypeError, ValueError):
+        parsed = pd.to_datetime(s.astype(str), dayfirst=True, errors="coerce")
+    return parsed if parsed.notna().mean() >= 0.9 else None
+
+
+_period_vals = list(raw[col_month].dropna().unique())
+_parsed = parse_periods(_period_vals)
+if _parsed is not None:
+    _cutoff = pd.Timestamp.today().normalize().replace(day=1)  # 1st of current month
+    _keep = {v for v, p in zip(_period_vals, _parsed)
+             if pd.notna(p) and p < _cutoff}
+    _dropped = [v for v in _period_vals if v not in _keep]
+    if _dropped:
+        raw = raw[raw[col_month].isin(_keep)]
+        st.info(
+            f"🗓️ **{len(_dropped)} period(s) excluded from analysis** — only "
+            f"completed months are scored (today is "
+            f"{pd.Timestamp.today():%d %b %Y}, so data up to "
+            f"{(_cutoff - pd.Timedelta(days=1)):%b %Y} is used). Dropped: "
+            f"{', '.join(str(d) for d in sorted(_dropped)[:8])}"
+            f"{'…' if len(_dropped) > 8 else ''}. Forecasts against months "
+            "that haven't finished shipping would count as pure error and "
+            "poison every accuracy figure."
+        )
+    if raw.empty:
+        st.error("No completed months left after the cutoff — the file only "
+                 "contains current/future periods.")
+        st.stop()
+else:
+    _drop_n = st.sidebar.number_input(
+        "Drop trailing period(s) as incomplete", min_value=0, max_value=6,
+        value=0,
+        help="Your period column has no calendar information (e.g. 1, 2, 3 …), "
+             "so the app can't auto-detect the current month. If the last "
+             "period(s) in the file are still shipping, drop them here.")
+    if _drop_n:
+        _keep_periods = sorted(raw[col_month].dropna().unique())[:-_drop_n]
+        raw = raw[raw[col_month].isin(_keep_periods)]
+        st.info(f"🗓️ Last {_drop_n} period(s) dropped as incomplete.")
+
 months_all = sorted(raw[col_month].dropna().unique().tolist())
 months_sorted = months_all[-12:]  # always cap analysis at the last 12 months
 if len(months_all) > 12:
