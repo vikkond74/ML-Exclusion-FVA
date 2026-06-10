@@ -112,12 +112,43 @@ all_cols = list(raw.columns)
 # -----------------------------------------------------------------------------
 st.sidebar.header("1 · Column mapping")
 
-g_excl = guess_column(all_cols, ["exclusion", "excluded", "excl"])
-g_month = guess_column(all_cols, ["month", "period", "fiscper", "date"])
-g_ml = guess_column(all_cols, ["ml forecast", "ml fc", "stat", "engine", "ml"])
-g_user = guess_column(all_cols, ["consensus", "user", "final", "demand plan",
-                                 "adopted", "pbu"])
-g_act = guess_column(all_cols, ["shipped", "actual", "sales", "deliver"])
+# Sequential auto-detection: once a column is claimed, it can't be claimed again,
+# and more specific keyword sets run first so "ML Exclusion" can't steal the
+# "ML forecast" slot (or vice versa).
+def guess_sequential(columns):
+    taken, out = set(), {}
+    specs = [
+        ("excl",  ["exclusion", "excluded", "excl flag"]),
+        ("month", ["month", "period", "fiscper", "date"]),
+        ("act",   ["shipped", "actual", "sales qty", "deliver", "sales"]),
+        ("ml",    ["ml forecast", "ml fc", "stat fc", "statistical", "engine",
+                   "shadow"]),
+        ("user",  ["consensus", "user forecast", "user fc", "final fc",
+                   "demand plan", "adopted", "pbu"]),
+        # last-resort loose passes
+        ("ml",    ["ml"]),
+        ("user",  ["user", "final"]),
+    ]
+    for slot, kws in specs:
+        if slot in out:
+            continue
+        for col in columns:
+            if col in taken:
+                continue
+            low = col.lower()
+            if any(kw in low for kw in kws):
+                out[slot] = col
+                taken.add(col)
+                break
+    return out
+
+
+guesses = guess_sequential(all_cols)
+g_excl = guesses.get("excl")
+g_month = guesses.get("month")
+g_ml = guesses.get("ml")
+g_user = guesses.get("user")
+g_act = guesses.get("act")
 
 
 def sel(label, guess, key):
@@ -131,6 +162,44 @@ col_month = sel("Month / period", g_month, "c_month")
 col_ml = sel("ML forecast (shadow / engine output)", g_ml, "c_ml")
 col_user = sel("User / consensus forecast", g_user, "c_user")
 col_act = sel("Shipped units (actuals)", g_act, "c_act")
+
+# ---- Mapping validation: never run silently on a broken mapping -------------
+mapped = [col_excl, col_month, col_ml, col_user, col_act]
+if len(set(mapped)) < len(mapped):
+    st.error(
+        "⛔ **Same column mapped to two roles.** Each of the five roles in the "
+        "sidebar (exclusion flag, month, ML forecast, user forecast, shipped "
+        "units) must point at a different column. Fix the mapping to continue."
+    )
+    st.stop()
+
+_flag_vals = set(raw[col_excl].dropna().astype(str).str.strip().str.upper().unique())
+_yes_vals = {"Y", "YES", "TRUE", "1", "X"}
+if not (_flag_vals & _yes_vals):
+    st.warning(
+        f"⚠️ The exclusion-flag column **{col_excl}** contains no Y/Yes/True/1/X "
+        f"values — every item will be treated as not excluded. Values found: "
+        f"`{sorted(_flag_vals)[:10]}`. If this is the wrong column, fix the "
+        "mapping in the sidebar."
+    )
+
+for _role, _c in [("ML forecast", col_ml), ("User forecast", col_user),
+                  ("Shipped units", col_act)]:
+    _num = pd.to_numeric(raw[_c], errors="coerce")
+    if _num.notna().mean() < 0.5:
+        st.warning(
+            f"⚠️ **{_role}** is mapped to `{_c}`, but most of its values are "
+            "not numeric — this looks like a wrong mapping."
+        )
+
+with st.expander("🧭 Column mapping in use", expanded=False):
+    st.table(pd.DataFrame({
+        "Role": ["Exclusion flag", "Month", "ML forecast", "User forecast",
+                 "Shipped units"],
+        "Column": mapped,
+        "Sample": [str(raw[c].dropna().iloc[0]) if raw[c].notna().any() else "—"
+                   for c in mapped],
+    }))
 
 measure_cols = {col_month, col_ml, col_user, col_act, col_excl}
 dim_candidates = [c for c in all_cols if c not in measure_cols]
@@ -329,6 +398,14 @@ with tab_table:
     if verdict_filter:
         tbl = tbl[tbl["verdict"].isin(verdict_filter)]
     tbl = tbl.sort_values("fva")  # worst exclusions first
+    if tbl.empty:
+        st.info(
+            "No rows match the current filters. If 'Excluded items' shows 0 "
+            "above, either this extract truly has no exclusions or the "
+            "exclusion-flag column is mis-mapped (check the sidebar). "
+            "Otherwise, add 'N' to the Exclusion flag filter to see "
+            "non-excluded items."
+        )
     st.dataframe(
         tbl[display_cols].rename(columns={
             "excl": "Excluded", "verdict": "Verdict", "fva": "FVA",
