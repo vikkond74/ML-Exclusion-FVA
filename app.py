@@ -647,7 +647,7 @@ with tab_summary:
                      + [
             "ML FC", "User FC", "Shipped units", "Σ |ML − Act|",
             "Σ |User − Act|", "FC Acc — ML", "FC Acc — User",
-            "FC Bias — ML", "FC Bias — User", "FVA", "Verdict"]
+            "FC Bias — ML", "FC Bias — User", "FVA", "Verdict"])
         st.dataframe(
             bsum.rename(columns={
                 bcol: str(bcol), "_excl": "Excluded",
