@@ -551,6 +551,11 @@ with tab_summary:
         excl_scope = st.radio("ML exclusion scope",
                               ["Both (split Y/N)", "Y only", "N only"],
                               horizontal=True)
+        view_mode = st.radio("View", ["Per month", "Aggregated"],
+                             horizontal=True,
+                             help="Per month: one line per group per selected "
+                                  "period. Aggregated: selected periods "
+                                  "summed into one line per group.")
     with cset2:
         _pp = parse_periods(months_sorted)
         if _pp is not None:
@@ -588,13 +593,17 @@ with tab_summary:
         )
         bg["err_ml"] = (bg["ml"] - bg["act"]).abs()
         bg["err_user"] = (bg["user"] - bg["act"]).abs()
-        bsum = (
-            bg.groupby(keys, dropna=False)
-              .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
-                   user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
-                   err_user=("err_user", "sum"))
-              .reset_index()
-        )
+        if view_mode == "Per month":
+            bsum = bg.rename(columns={"ml": "ml_sum",
+                                      "user": "user_sum"}).copy()
+        else:
+            bsum = (
+                bg.groupby(keys, dropna=False)
+                  .agg(act=("act", "sum"), ml_sum=("ml", "sum"),
+                       user_sum=("user", "sum"), err_ml=("err_ml", "sum"),
+                       err_user=("err_user", "sum"))
+                  .reset_index()
+            )
         bsum["bias_ml"] = np.where(bsum["act"] > 0,
                                    (bsum["ml_sum"] - bsum["act"]) / bsum["act"],
                                    np.nan)
@@ -613,22 +622,29 @@ with tab_summary:
             ["👤 User adds value", "🤖 ML more accurate"], default="≈ Tie")
         bsum.loc[bsum["fva"].isna(), "Verdict"] = "⚪ No demand"
 
+        vol_order = (bsum.groupby(bcol)["act"].sum()
+                         .sort_values(ascending=False).index.tolist())
+        bsum["_vol_rank"] = bsum[bcol].map(
+            {v: i for i, v in enumerate(vol_order)})
+        sort_keys = ["_vol_rank"]
+        sort_asc = [True]
         if split_by_excl:
-            vol_order = (bsum.groupby(bcol)["act"].sum()
-                             .sort_values(ascending=False).index.tolist())
-            bsum["_vol_rank"] = bsum[bcol].map(
-                {v: i for i, v in enumerate(vol_order)})
-            bsum = bsum.sort_values(["_vol_rank", "_excl"],
-                                    ascending=[True, False]).drop(
-                                        columns="_vol_rank")
-        else:
-            bsum = bsum.sort_values("act", ascending=False)
+            sort_keys.append("_excl")
+            sort_asc.append(False)
+        if view_mode == "Per month":
+            sort_keys.append(col_month)
+            sort_asc.append(True)
+        bsum = bsum.sort_values(sort_keys, ascending=sort_asc).drop(
+            columns="_vol_rank")
 
         st.caption(f"Scope: **{excl_scope}** · {len(sel_periods)} period(s): "
                    f"{', '.join(str(p) for p in sel_periods[:6])}"
                    f"{'…' if len(sel_periods) > 6 else ''}")
 
-        show_cols = [str(bcol)] + (["Excluded"] if split_by_excl else []) + [
+        show_cols = ([str(bcol)]
+                     + (["Excluded"] if split_by_excl else [])
+                     + ([str(col_month)] if view_mode == "Per month" else [])
+                     + [
             "ML FC", "User FC", "Shipped units", "Σ |ML − Act|",
             "Σ |User − Act|", "FC Acc — ML", "FC Acc — User",
             "FC Bias — ML", "FC Bias — User", "FVA", "Verdict"]
@@ -660,11 +676,30 @@ with tab_summary:
             },
         )
 
+        # Charts always show the aggregated view (one bar per group), even
+        # when the table is per-month.
+        if view_mode == "Per month":
+            csum = (bg.groupby(keys, dropna=False)
+                      .agg(act=("act", "sum"), err_ml=("err_ml", "sum"),
+                           err_user=("err_user", "sum"))
+                      .reset_index())
+            csum["fa_ml"] = (1 - np.where(csum["act"] > 0,
+                                          csum["err_ml"] / csum["act"],
+                                          np.nan)).clip(min=0)
+            csum["fa_user"] = (1 - np.where(csum["act"] > 0,
+                                            csum["err_user"] / csum["act"],
+                                            np.nan)).clip(min=0)
+            chart_src = csum.sort_values("act", ascending=False)
+            st.caption("Charts show the selected periods aggregated.")
+        else:
+            chart_src = bsum
+
         if split_by_excl:
-            top_groups = (bsum.groupby(bcol)["act"].sum()
+            top_groups = (chart_src.groupby(bcol)["act"].sum()
                               .sort_values(ascending=False).head(12)
                               .index.tolist())
-            plot_bd = bsum[bsum[bcol].isin(top_groups) & bsum["fa_ml"].notna()]
+            plot_bd = chart_src[chart_src[bcol].isin(top_groups)
+                                & chart_src["fa_ml"].notna()]
             if not plot_bd.empty:
                 long = plot_bd.melt(
                     id_vars=[bcol, "_excl"], value_vars=["fa_ml", "fa_user"],
@@ -691,7 +726,7 @@ with tab_summary:
                 st.caption("Top 12 groups by shipped volume, split into "
                            "excluded (Y) and not-excluded (N) items.")
         else:
-            plot_bd = bsum[bsum["fa_ml"].notna()].head(20)
+            plot_bd = chart_src[chart_src["fa_ml"].notna()].head(20)
             if len(plot_bd) > 1:
                 figb = go.Figure()
                 figb.add_bar(x=plot_bd[bcol].astype(str), y=plot_bd["fa_ml"],
@@ -721,8 +756,23 @@ with tab_summary:
 
 with tab_drill:
     item["_label"] = make_label(item, level_cols)
-    order = item.sort_values("fva")["_label"].tolist()
-    pick = st.selectbox("Pick an item (sorted worst FVA first)", order)
+
+    # Filter the granularity: one cascading filter per dimension column.
+    filt = item.copy()
+    fcols = st.columns(len(level_cols))
+    for i, c in enumerate(level_cols):
+        opts = ["All"] + sorted(filt[c].astype(str).unique().tolist())
+        choice = fcols[i].selectbox(str(c), opts, key=f"drill_{c}")
+        if choice != "All":
+            filt = filt[filt[c].astype(str) == choice]
+
+    if filt.empty:
+        st.warning("No items match the current filters.")
+        st.stop()
+
+    order = filt.sort_values("fva")["_label"].tolist()
+    st.caption(f"{len(order)} item(s) match — sorted worst FVA first.")
+    pick = st.selectbox("Item", order)
     sel_row = item[item["_label"] == pick].iloc[0]
     mask = pd.Series(True, index=grp_month.index)
     for c in level_cols:
