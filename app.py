@@ -793,12 +793,20 @@ with tab_summary:
 with tab_drill:
     item["_label"] = make_label(item, level_cols)
 
-    # Filter the granularity: one cascading filter per dimension column.
+    # Filter the granularity: exclusion flag first (default Y — the list the
+    # tool exists to judge), then one cascading filter per dimension column.
     filt = item.copy()
-    fcols = st.columns(len(level_cols))
+    _flag_opts = ["Y", "N", "All"]
+    if (item["excl"] == "Mixed").any():
+        _flag_opts.insert(2, "Mixed")
+    fcols = st.columns([1] + [2] * len(level_cols))
+    flag_choice = fcols[0].selectbox("ML Exclusion", _flag_opts, index=0,
+                                     key="drill_excl")
+    if flag_choice != "All":
+        filt = filt[filt["excl"] == flag_choice]
     for i, c in enumerate(level_cols):
         opts = ["All"] + sorted(as_str(filt[c]).unique().tolist())
-        choice = fcols[i].selectbox(str(c), opts, key=f"drill_{c}")
+        choice = fcols[i + 1].selectbox(str(c), opts, key=f"drill_{c}")
         if choice != "All":
             filt = filt[as_str(filt[c]) == choice]
 
@@ -815,12 +823,13 @@ with tab_drill:
         mask &= as_str(grp_month[c]) == str(sel_row[c])
     ts = grp_month[mask].sort_values(col_month)
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Verdict", sel_row["verdict"])
-    m2.metric("FVA", fmt_pct(sel_row["fva"]))
-    m3.metric("User win rate",
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("ML Exclusion", sel_row["excl"])
+    m2.metric("Verdict", sel_row["verdict"])
+    m3.metric("FVA", fmt_pct(sel_row["fva"]))
+    m4.metric("User win rate",
               f"{sel_row['user_win_n']:.0f}/{sel_row['months']:.0f} months")
-    m4.metric("Shipped units", f"{sel_row['act_sum']:,.0f}")
+    m5.metric("Shipped units", f"{sel_row['act_sum']:,.0f}")
 
     fig2 = go.Figure()
     fig2.add_bar(x=ts[col_month], y=ts["act"], name="Shipped units",
