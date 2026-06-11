@@ -317,16 +317,54 @@ if _parsed is not None:
                  "contains current/future periods.")
         st.stop()
 else:
-    st.warning(
-        f"⚠️ **Current/future months could NOT be auto-dropped.** The period "
-        f"column `{col_month}` carries no recognizable calendar information "
-        f"(values look like: "
-        f"`{', '.join(str(v) for v in _period_vals[:5])}`…), so the app "
-        "cannot tell which periods are still shipping. **Forecast months "
-        "without complete actuals will poison every accuracy figure** — use "
-        "the sidebar control to drop trailing incomplete period(s), or tell "
-        "the developer this period format so it can be added."
-    )
+    _nums = pd.to_numeric(pd.Series(_period_vals), errors="coerce")
+    _cur_m = pd.Timestamp.today().month
+    _cur_y = pd.Timestamp.today().year
+    if (_nums.notna().all() and _nums.between(1, 12).all()
+            and (_nums < _cur_m).all()):
+        # Month numbers 1..(current month − 1): under the natural reading
+        # (calendar months of the current year) every period is already
+        # completed — nothing to drop, no warning needed.
+        st.caption(
+            f"🗓️ Period numbers {int(_nums.min())}–{int(_nums.max())} read as "
+            f"calendar months of {_cur_y}; all completed (today is "
+            f"{pd.Timestamp.today():%d %b %Y})."
+        )
+    elif _nums.notna().all() and _nums.between(1, 12).all():
+        # Some month numbers ≥ current month: ambiguous — could be
+        # current-year months (incomplete!) or a rolling history. Ask.
+        interp = st.radio(
+            f"⚠️ The period column has month numbers up to "
+            f"{int(_nums.max())}, but only months 1–{_cur_m - 1} of {_cur_y} "
+            "are completed. How should the numbers be read?",
+            [f"Calendar months of {_cur_y} → drop months ≥ {_cur_m} as "
+             "incomplete",
+             "Sequence numbers of past periods (e.g. rolling 12-month "
+             "history) → keep all"],
+            index=0)
+        if interp.startswith("Calendar"):
+            _keep_nums = {v for v, n in zip(_period_vals, _nums)
+                          if n < _cur_m}
+            _dropped = [v for v in _period_vals if v not in _keep_nums]
+            raw = raw[raw[col_month].isin(_keep_nums)]
+            if _dropped:
+                st.info(f"🗓️ Dropped month(s) "
+                        f"{', '.join(str(d) for d in sorted(_dropped))} as "
+                        "not yet completed.")
+            if raw.empty:
+                st.error("No completed months left after the cutoff.")
+                st.stop()
+    else:
+        st.warning(
+            f"⚠️ **Current/future months could NOT be auto-dropped.** The "
+            f"period column `{col_month}` carries no recognizable calendar "
+            f"information (values look like: "
+            f"`{', '.join(str(v) for v in _period_vals[:5])}`…), so the app "
+            "cannot tell which periods are still shipping. **Forecast months "
+            "without complete actuals will poison every accuracy figure** — "
+            "use the sidebar control to drop trailing incomplete period(s), "
+            "or tell the developer this period format so it can be added."
+        )
     _drop_n = st.sidebar.number_input(
         "Drop trailing period(s) as incomplete", min_value=0, max_value=6,
         value=0,
