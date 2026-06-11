@@ -82,22 +82,44 @@ def parse_periods(vals):
     return parsed if parsed.notna().mean() >= 0.9 else None
 
 
-def simple_metrics(frame):
-    """Variance / Bias % / FCA for a frame with ml, user, act columns,
-    summed over the frame."""
-    a = frame["act"].sum()
-    m = frame["ml"].sum()
-    u = frame["user"].sum()
-    var_ml = m - a
-    var_user = u - a
-    return {
-        "ML FC": m, "User FC": u, "Shipped": a,
-        "Variance ML": var_ml, "Variance User": var_user,
-        "Bias % ML": var_ml / a if a else np.nan,
-        "Bias % User": var_user / a if a else np.nan,
-        "FCA ML": max(0.0, 1 - abs(var_ml) / a) if a else np.nan,
-        "FCA User": max(0.0, 1 - abs(var_user) / a) if a else np.nan,
-    }
+def group_metrics(frame, by, fca_level, month_col):
+    """Metrics for each group in `by` (or one overall row if `by` is empty).
+
+    FCA is computed the statistically sound way: absolute errors at the FCA
+    calculation level (e.g. SKU) x month, summed, divided by summed shipments
+    -- equivalent to a volume-weighted average of item-level FCAs. No netting.
+    Variance and Bias are net by design (over/under SHOULD offset there).
+    """
+    grain = list(by)
+    grain += [c for c in fca_level if c not in grain]
+    if month_col not in grain:
+        grain.append(month_col)
+    base = (frame.groupby(grain, dropna=False)
+            .agg(ml=("ml", "sum"), user=("user", "sum"), act=("act", "sum"))
+            .reset_index())
+    base["em"] = (base["ml"] - base["act"]).abs()
+    base["eu"] = (base["user"] - base["act"]).abs()
+    if by:
+        g = (base.groupby(list(by), dropna=False)
+             .agg(ml=("ml", "sum"), user=("user", "sum"), act=("act", "sum"),
+                  em=("em", "sum"), eu=("eu", "sum"))
+             .reset_index())
+    else:
+        g = pd.DataFrame([{"ml": base["ml"].sum(), "user": base["user"].sum(),
+                           "act": base["act"].sum(), "em": base["em"].sum(),
+                           "eu": base["eu"].sum()}])
+    a = g["act"]
+    out = g[list(by)].copy() if by else pd.DataFrame(index=g.index)
+    out["ML FC"] = g["ml"]
+    out["User FC"] = g["user"]
+    out["Shipped"] = a
+    out["Variance ML"] = g["ml"] - a
+    out["Variance User"] = g["user"] - a
+    out["Bias % ML"] = pd.Series(np.where(a > 0, (g["ml"] - a) / a, np.nan))
+    out["Bias % User"] = pd.Series(np.where(a > 0, (g["user"] - a) / a, np.nan))
+    out["FCA ML"] = pd.Series(np.where(a > 0, 1 - g["em"] / a, np.nan)).clip(lower=0)
+    out["FCA User"] = pd.Series(np.where(a > 0, 1 - g["eu"] / a, np.nan)).clip(lower=0)
+    return out
 
 
 def add_verdict(df_, thr):
@@ -303,6 +325,16 @@ months_sorted = months_all[-12:]
 if len(months_all) > 12:
     st.sidebar.caption(f"ℹ️ {len(months_all)} periods in file — limited to "
                        f"the most recent 12.")
+dim_candidates = [c for c in all_cols
+                  if c not in {col_excl, col_month, col_ml, col_user, col_act}]
+fca_level = st.sidebar.multiselect(
+    "FCA calculation level", dim_candidates, default=dim_candidates,
+    help="FCA is computed from absolute errors at this level x month, then "
+         "volume-weighted up (no netting across items). Default: the lowest "
+         "level in the file. E.g. pick only the SKU column for SKU-level FCA.")
+if not fca_level:
+    st.sidebar.error("Pick at least one column for the FCA level.")
+    st.stop()
 fca_threshold = st.sidebar.slider(
     "Verdict materiality threshold (pp of FCA)", 1, 25, 5,
     help="How much higher one side's FCA must be before it counts as a clear "
@@ -351,8 +383,10 @@ rows = []
 for label, frame in [("All items", df),
                      ("Excluded (Y)", df[df["_excl"] == "Y"]),
                      ("Not excluded (N)", df[df["_excl"] == "N"])]:
-    rows.append({"Scope": label, **simple_metrics(frame)})
-sc = add_verdict(pd.DataFrame(rows), fca_threshold)
+    m = group_metrics(frame, [], fca_level, col_month)
+    m.insert(0, "Scope", label)
+    rows.append(m)
+sc = add_verdict(pd.concat(rows, ignore_index=True), fca_threshold)
 st.dataframe(sc, width="stretch", hide_index=True,
              column_config=COLUMN_CONFIG)
 
@@ -417,12 +451,7 @@ split_by_excl = excl_scope.startswith("Both") and bcol != col_excl
 keys = [bcol, "_excl"] if split_by_excl else [bcol]
 group_keys = keys + ([col_month] if view_mode == "Per month" else [])
 
-bsum = (dfb.groupby(group_keys, dropna=False)
-        .agg(ml=("ml", "sum"), user=("user", "sum"), act=("act", "sum"))
-        .reset_index())
-metrics = pd.DataFrame(
-    [simple_metrics(bsum.iloc[[i]]) for i in range(len(bsum))])
-bsum = pd.concat([bsum[group_keys].reset_index(drop=True), metrics], axis=1)
+bsum = group_metrics(dfb, group_keys, fca_level, col_month)
 bsum = add_verdict(bsum, fca_threshold)
 
 # Order: biggest groups first; Y before N; months in order
@@ -451,12 +480,7 @@ st.download_button(
     "summed_up_analysis.csv", "text/csv")
 
 # ---- FCA chart (always aggregated view) --------------------------------------
-csum = (dfb.groupby(keys, dropna=False)
-        .agg(ml=("ml", "sum"), user=("user", "sum"), act=("act", "sum"))
-        .reset_index())
-cmet = pd.DataFrame(
-    [simple_metrics(csum.iloc[[i]]) for i in range(len(csum))])
-csum = pd.concat([csum[keys].reset_index(drop=True), cmet], axis=1)
+csum = group_metrics(dfb, keys, fca_level, col_month)
 csum = csum.sort_values("Shipped", ascending=False)
 if view_mode == "Per month":
     st.caption("Chart shows the selected periods aggregated.")
@@ -498,8 +522,8 @@ else:
         st.plotly_chart(figb, width="stretch")
         st.caption("Top 20 groups by shipped volume.")
 
-st.caption("Methodology: Variance = FC − Shipped (signed units) · "
-           "Bias % = Variance / Shipped · FCA = 1 − |Variance| / Shipped, "
-           "floored at 0. Computed on sums at the selected grouping — over- "
-           "and under-forecasts within a group net out, which is intended in "
-           "this simple view.")
+st.caption("Methodology: Variance = FC − Shipped and Bias % = Variance / "
+           "Shipped are NET (over/under offset by design). FCA is NOT "
+           "netted: absolute errors are computed at the FCA calculation "
+           "level × month (see sidebar), summed, and divided by summed "
+           "shipments — equivalent to volume-weighting item-level FCAs.")
