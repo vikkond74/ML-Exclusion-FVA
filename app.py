@@ -522,6 +522,79 @@ else:
         st.plotly_chart(figb, width="stretch")
         st.caption("Top 20 groups by shipped volume.")
 
+# -----------------------------------------------------------------------------
+# 8 · Item drill-in (level chosen by the user; same metric logic as above)
+# -----------------------------------------------------------------------------
+st.subheader("🔬 Item drill-in")
+d1, d2 = st.columns([1, 3])
+with d1:
+    drill_flag = st.selectbox("ML Exclusion", ["Y", "N", "All"], index=0,
+                              key="drill_flag")
+with d2:
+    drill_cols = st.multiselect(
+        "Drill level — pick the column(s) that define an item",
+        dim_candidates, default=dim_candidates[:1],
+        help="Items are listed at exactly this level: pick SPU for SPU-level "
+             "items, SPU + SKU for that combination, SPU + Cluster for that "
+             "one. Variance/Bias stay net per item; FCA still comes from "
+             "absolute errors at the FCA calculation level × month "
+             "(sidebar), volume-weighted — identical logic to the tables "
+             "above.")
+
+if not drill_cols:
+    st.info("Pick at least one column to drill into.")
+else:
+    dfd = df[df[col_month].isin(sel_periods)]
+    if drill_flag != "All":
+        dfd = dfd[dfd["_excl"] == drill_flag]
+    if dfd.empty:
+        st.warning("No rows match this exclusion scope and period selection.")
+    else:
+        items = group_metrics(dfd, drill_cols, fca_level, col_month)
+        items = add_verdict(items, fca_threshold)
+        items = items.sort_values("FCA User − ML", na_position="last")
+        st.caption(f"{len(items)} item(s) at level "
+                   f"**{' › '.join(drill_cols)}** · scope **{drill_flag}** · "
+                   "sorted worst FVA first.")
+        st.dataframe(items, width="stretch", hide_index=True, height=380,
+                     column_config=COLUMN_CONFIG)
+        st.download_button(
+            "⬇️ Download item table (CSV)",
+            items.to_csv(index=False).encode(),
+            "item_drill_in.csv", "text/csv")
+
+        # ---- Monthly detail for one item ------------------------------------
+        lbl = as_str(items[drill_cols[0]])
+        for c in drill_cols[1:]:
+            lbl = lbl + " | " + as_str(items[c])
+        items = items.assign(_label=lbl)
+        pick = st.selectbox("Monthly detail for", items["_label"].tolist(),
+                            key="drill_pick")
+        sel_it = items[items["_label"] == pick].iloc[0]
+        mask = pd.Series(True, index=dfd.index)
+        for c in drill_cols:
+            mask &= as_str(dfd[c]) == str(sel_it[c])
+        per_month = group_metrics(dfd[mask], [col_month], fca_level,
+                                  col_month)
+        per_month = add_verdict(per_month, fca_threshold)
+        per_month = per_month.sort_values(col_month)
+
+        figd = go.Figure()
+        figd.add_bar(x=per_month[col_month], y=per_month["Shipped"],
+                     name="Shipped", marker_color="#94a3b8", opacity=0.55)
+        figd.add_scatter(x=per_month[col_month], y=per_month["ML FC"],
+                         name="ML FC", mode="lines+markers",
+                         line=dict(color="#ef4444", width=2))
+        figd.add_scatter(x=per_month[col_month], y=per_month["User FC"],
+                         name="User FC", mode="lines+markers",
+                         line=dict(color="#3b82f6", width=2))
+        figd.update_layout(height=400, xaxis_title="Month",
+                           yaxis_title="Units",
+                           legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(figd, width="stretch")
+        st.dataframe(per_month, width="stretch", hide_index=True,
+                     column_config=COLUMN_CONFIG)
+
 st.caption("Methodology: Variance = FC − Shipped and Bias % = Variance / "
            "Shipped are NET (over/under offset by design). FCA is NOT "
            "netted: absolute errors are computed at the FCA calculation "
