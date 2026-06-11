@@ -80,11 +80,17 @@ def fmt_pct(x):
     return "—" if pd.isna(x) else f"{x:0.0%}"
 
 
+def as_str(series):
+    """NA-safe string conversion: pandas 3.x astype(str) keeps missing values
+    as NA (unsortable, breaks boolean masks) instead of 'nan'."""
+    return series.astype(str).fillna("(blank)")
+
+
 def make_label(frame, cols):
     """Concatenate dimension columns into one display label (version-proof)."""
-    lbl = frame[cols[0]].astype(str)
+    lbl = as_str(frame[cols[0]])
     for c in cols[1:]:
-        lbl = lbl + " | " + frame[c].astype(str)
+        lbl = lbl + " | " + as_str(frame[c])
     return lbl
 
 
@@ -791,10 +797,10 @@ with tab_drill:
     filt = item.copy()
     fcols = st.columns(len(level_cols))
     for i, c in enumerate(level_cols):
-        opts = ["All"] + sorted(filt[c].astype(str).unique().tolist())
+        opts = ["All"] + sorted(as_str(filt[c]).unique().tolist())
         choice = fcols[i].selectbox(str(c), opts, key=f"drill_{c}")
         if choice != "All":
-            filt = filt[filt[c].astype(str) == choice]
+            filt = filt[as_str(filt[c]) == choice]
 
     if filt.empty:
         st.warning("No items match the current filters.")
@@ -806,7 +812,7 @@ with tab_drill:
     sel_row = item[item["_label"] == pick].iloc[0]
     mask = pd.Series(True, index=grp_month.index)
     for c in level_cols:
-        mask &= grp_month[c].astype(str) == str(sel_row[c])
+        mask &= as_str(grp_month[c]) == str(sel_row[c])
     ts = grp_month[mask].sort_values(col_month)
 
     m1, m2, m3, m4 = st.columns(4)
