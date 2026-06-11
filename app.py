@@ -223,24 +223,54 @@ st.sidebar.header("3 · Verdict settings")
 
 # ---- Completed months only: drop the current month and anything beyond ------
 def parse_periods(vals):
-    """Try to interpret period values as calendar months. Returns parsed
-    datetimes aligned to vals, or None if the values carry no calendar info
-    (e.g. relative period numbers 1..12)."""
+    """Interpret period values as calendar months, tolerating MIXED types in
+    one column (numeric YYYYMM next to date strings — common in Excel reads).
+    Returns parsed datetimes aligned to vals, or None if values carry no
+    calendar info (e.g. relative period numbers 1..12)."""
     s = pd.Series(list(vals))
     num = pd.to_numeric(s, errors="coerce")
-    if num.notna().all():
-        if num.between(1, 600).all():
-            return None  # relative period numbering, no calendar anchor
-        if num.between(190001, 209912).all():  # YYYYMM
-            return pd.to_datetime(num.astype(int).astype(str), format="%Y%m",
-                                  errors="coerce")
-    try:
-        parsed = pd.to_datetime(s.astype(str), format="mixed",
-                                dayfirst=True, errors="coerce")
-    except (TypeError, ValueError):
-        parsed = pd.to_datetime(s.astype(str), dayfirst=True, errors="coerce")
+    if num.notna().all() and num.between(1, 600).all():
+        return None  # relative period numbering, no calendar anchor
+    parsed = pd.Series(pd.NaT, index=s.index)
+    is_yyyymm = num.notna() & num.between(190001, 209912)
+    if is_yyyymm.any():
+        parsed[is_yyyymm] = pd.to_datetime(
+            num[is_yyyymm].astype(int).astype(str), format="%Y%m",
+            errors="coerce")
+    rest = parsed.isna()
+    if rest.any():
+        try:
+            parsed[rest] = pd.to_datetime(s[rest].astype(str), format="mixed",
+                                          dayfirst=True, errors="coerce")
+        except (TypeError, ValueError):
+            parsed[rest] = pd.to_datetime(s[rest].astype(str), dayfirst=True,
+                                          errors="coerce")
     return parsed if parsed.notna().mean() >= 0.9 else None
 
+
+# ---- Normalize the period column to ONE sortable type -----------------------
+# Excel reads often deliver mixed types (some cells numeric, some text), which
+# crashes sorting with "'<' not supported between float and str".
+_pvals = list(raw[col_month].dropna().unique())
+_pnorm = parse_periods(_pvals)
+if _pnorm is not None:
+    _pmap = {v: (f"{d.year}-{d.month:02d}" if pd.notna(d) else None)
+             for v, d in zip(_pvals, _pnorm)}
+    _before = len(raw)
+    raw = raw.copy()
+    raw[col_month] = raw[col_month].map(_pmap)
+    raw = raw[raw[col_month].notna()]
+    if len(raw) < _before:
+        st.warning(f"⚠️ {_before - len(raw)} row(s) dropped: period value "
+                   "could not be interpreted as a month.")
+else:
+    _pnum = pd.to_numeric(raw[col_month], errors="coerce")
+    if _pnum.notna().mean() >= 0.9:
+        raw = raw[_pnum.notna()].copy()
+        raw[col_month] = pd.to_numeric(raw[col_month])
+    else:
+        raw = raw.copy()
+        raw[col_month] = raw[col_month].astype(str)
 
 _period_vals = list(raw[col_month].dropna().unique())
 _parsed = parse_periods(_period_vals)
@@ -489,7 +519,7 @@ with tab_summary:
     sc.loc[sc["FVA"].isna(), "Verdict"] = "⚪ No demand"
 
     st.dataframe(
-        sc, use_container_width=True, hide_index=True,
+        sc, width="stretch", hide_index=True,
         column_config={
             "FC Acc — ML": st.column_config.NumberColumn(
                 format="percent", help="FA = 1 − WMAPE, floored at 0."),
@@ -657,7 +687,7 @@ with tab_summary:
                 "fa_ml": "FC Acc — ML", "fa_user": "FC Acc — User",
                 "bias_ml": "FC Bias — ML", "bias_user": "FC Bias — User",
                 "fva": "FVA"})[show_cols],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             column_config={
                 "FC Acc — ML": st.column_config.NumberColumn(format="percent"),
                 "FC Acc — User": st.column_config.NumberColumn(format="percent"),
@@ -722,7 +752,7 @@ with tab_summary:
                 figb.update_layout(height=440, yaxis_tickformat=".0%",
                                    legend=dict(orientation="h", y=1.12))
                 figb.update_yaxes(tickformat=".0%")
-                st.plotly_chart(figb, use_container_width=True)
+                st.plotly_chart(figb, width="stretch")
                 st.caption("Top 12 groups by shipped volume, split into "
                            "excluded (Y) and not-excluded (N) items.")
         else:
@@ -742,7 +772,7 @@ with tab_summary:
                 figb.update_xaxes(
                     categoryorder="array",
                     categoryarray=plot_bd[bcol].astype(str).tolist())
-                st.plotly_chart(figb, use_container_width=True)
+                st.plotly_chart(figb, width="stretch")
                 st.caption("Top 20 groups by shipped volume.")
 
     export_cols = level_cols + ["excl", "verdict", "fva", "wmape_ml",
@@ -795,7 +825,7 @@ with tab_drill:
                      mode="lines+markers", line=dict(color="#3b82f6", width=2))
     fig2.update_layout(height=440, xaxis_title="Month", yaxis_title="Units",
                        legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
     month_tbl = ts[[col_month, "ml", "user", "act", "err_ml", "err_user"]].copy()
     month_tbl["Closer"] = np.select(
@@ -805,7 +835,7 @@ with tab_drill:
     st.dataframe(month_tbl.rename(columns={
         "ml": "ML FC", "user": "User FC", "act": "Shipped",
         "err_ml": "|ML err|", "err_user": "|User err|"}),
-        use_container_width=True, hide_index=True)
+        width="stretch", hide_index=True)
 
 st.caption(
     "Methodology: volume-weighted WMAPE per item over the trailing window; "
