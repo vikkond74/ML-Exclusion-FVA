@@ -235,7 +235,8 @@ def parse_periods(vals):
     calendar info (e.g. relative period numbers 1..12)."""
     s = pd.Series(list(vals))
     num = pd.to_numeric(s, errors="coerce")
-    if num.notna().all() and num.between(1, 600).all():
+    if (num.notna().all() and num.between(1, 600).all()
+            and (num % 1 == 0).all()):
         return None  # relative period numbering, no calendar anchor
     parsed = pd.Series(pd.NaT, index=s.index)
     is_yyyymm = num.notna() & num.between(190001, 209912)
