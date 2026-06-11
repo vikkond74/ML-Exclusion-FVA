@@ -245,6 +245,20 @@ def parse_periods(vals):
             errors="coerce")
     rest = parsed.isna()
     if rest.any():
+        # Explicit MM.YYYY / MM-YYYY / MM/YYYY (common SAP period style, which
+        # generic parsers misread or reject)
+        ext = s[rest].astype(str).str.strip().str.extract(
+            r"^(?P<m>\d{1,2})[./\-](?P<y>\d{4})$")
+        ok = ext["m"].notna() & ext["y"].notna()
+        if ok.any():
+            mm = ext.loc[ok, "m"].astype(int)
+            valid = mm.between(1, 12)
+            idx = ext.index[ok][valid]
+            parsed.loc[idx] = pd.to_datetime(
+                ext.loc[idx, "y"] + "-" + ext.loc[idx, "m"].str.zfill(2),
+                format="%Y-%m", errors="coerce")
+    rest = parsed.isna()
+    if rest.any():
         try:
             parsed[rest] = pd.to_datetime(s[rest].astype(str), format="mixed",
                                           dayfirst=True, errors="coerce")
@@ -302,6 +316,16 @@ if _parsed is not None:
                  "contains current/future periods.")
         st.stop()
 else:
+    st.warning(
+        f"⚠️ **Current/future months could NOT be auto-dropped.** The period "
+        f"column `{col_month}` carries no recognizable calendar information "
+        f"(values look like: "
+        f"`{', '.join(str(v) for v in _period_vals[:5])}`…), so the app "
+        "cannot tell which periods are still shipping. **Forecast months "
+        "without complete actuals will poison every accuracy figure** — use "
+        "the sidebar control to drop trailing incomplete period(s), or tell "
+        "the developer this period format so it can be added."
+    )
     _drop_n = st.sidebar.number_input(
         "Drop trailing period(s) as incomplete", min_value=0, max_value=6,
         value=0,
