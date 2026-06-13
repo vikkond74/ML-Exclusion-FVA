@@ -122,6 +122,80 @@ def group_metrics(frame, by, fca_level, month_col):
     return out
 
 
+def item_diagnostics(frame, by, fca_level, month_col):
+    """Per-item confidence and phasing/level error split, using the SAME
+    grain as FCA (fca_level x month). Returns one row per group in `by`.
+
+    Confidence blends: shipped volume (signal), months of demand (history),
+    and win consistency (did one side win most months, or was it noise).
+
+    Error decomposition for each forecast (vs shipped):
+      gross  = Σ |error| over fca_level x month   (what FCA penalises)
+      level  = |Σ error|                          (wrong total volume)
+      phasing = gross − level                      (right total, wrong months)
+    A high phasing share means timing, not volume, is the problem.
+    """
+    grain = list(by) + [c for c in fca_level if c not in by]
+    if month_col not in grain:
+        grain.append(month_col)
+    base = (frame.groupby(grain, dropna=False)
+            .agg(ml=("ml", "sum"), user=("user", "sum"), act=("act", "sum"))
+            .reset_index())
+    base["e_ml"] = base["ml"] - base["act"]
+    base["e_user"] = base["user"] - base["act"]
+
+    # Monthly win flags at the group x month level (for consistency)
+    mgrain = list(by) + [month_col]
+    mon = (base.groupby(mgrain, dropna=False)
+           .agg(e_ml=("e_ml", "sum"), e_user=("e_user", "sum"),
+                act=("act", "sum"))
+           .reset_index())
+    mon["user_better"] = mon["e_user"].abs() < mon["e_ml"].abs()
+    mon["has_demand"] = (mon["act"] > 0) | (mon["e_ml"] != 0) | (mon["e_user"] != 0)
+
+    rows = []
+    grp_iter = base.groupby(list(by), dropna=False) if by else [((), base)]
+    mon_grp = (mon.groupby(list(by), dropna=False)
+               if by else [((), mon)])
+    mon_lookup = {k: g for k, g in mon_grp} if by else {(): mon}
+    for key, g in (grp_iter if by else [((), base)]):
+        k = key if isinstance(key, tuple) else (key,)
+        mg = mon_lookup.get(key if by else (), mon)
+        mg = mg[mg["has_demand"]]
+        n_months = len(mg)
+        act = g["act"].sum()
+        gross_ml = g["e_ml"].abs().sum()
+        gross_user = g["e_user"].abs().sum()
+        level_ml = abs(g["e_ml"].sum())
+        level_user = abs(g["e_user"].sum())
+        win_rate = mg["user_better"].mean() if n_months else np.nan
+        # consistency: how lopsided the monthly wins are (0.5 = coin-flip)
+        consistency = abs(win_rate - 0.5) * 2 if pd.notna(win_rate) else 0.0
+        # volume score: log-scaled, saturates by ~10k units
+        vol_score = min(1.0, np.log1p(act) / np.log1p(10000)) if act > 0 else 0.0
+        month_score = min(1.0, n_months / 6.0)
+        conf = 0.45 * vol_score + 0.30 * month_score + 0.25 * consistency
+        row = {}
+        if by:
+            for col, val in zip(by, k):
+                row[col] = val
+        row["Confidence"] = conf
+        row["Conf tier"] = ("🟩 High" if conf >= 0.66 else
+                            "🟨 Medium" if conf >= 0.4 else "🟥 Low")
+        row["Months w/ demand"] = n_months
+        row["User win rate"] = win_rate
+        row["Phasing % ML"] = ((gross_ml - level_ml) / gross_ml
+                               if gross_ml > 0 else np.nan)
+        row["Phasing % User"] = ((gross_user - level_user) / gross_user
+                                 if gross_user > 0 else np.nan)
+        row["Err type User"] = (
+            "—" if gross_user == 0 else
+            "⏱️ Phasing" if (gross_user - level_user) / gross_user >= 0.6 else
+            "📊 Level" if level_user / gross_user >= 0.6 else "Mixed")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def add_verdict(df_, thr):
     diff = df_["FCA User"] - df_["FCA ML"]
     df_["FCA User − ML"] = diff
@@ -143,6 +217,21 @@ COLUMN_CONFIG = {
         format="%,.0f", help="User FC − Shipped (positive = over-forecast)."),
     "FCA User − ML": st.column_config.NumberColumn(
         format="percent", help="Positive = the user forecast adds value."),
+}
+
+DRILL_COLUMN_CONFIG = {
+    **COLUMN_CONFIG,
+    "Confidence": st.column_config.ProgressColumn(
+        format="percent", min_value=0, max_value=1,
+        help="Blend of shipped volume, months of demand, and how consistently "
+             "one side wins. Low = treat the verdict as tentative."),
+    "User win rate": st.column_config.NumberColumn(
+        format="percent",
+        help="Share of months where the user forecast was closer than ML."),
+    "Phasing % User": st.column_config.NumberColumn(
+        format="percent",
+        help="Share of the user's gross error that is timing (right total, "
+             "wrong months) rather than wrong total volume."),
 }
 
 
@@ -552,15 +641,27 @@ else:
     else:
         items = group_metrics(dfd, drill_cols, fca_level, col_month)
         items = add_verdict(items, fca_threshold)
-        items = items.sort_values("FCA User − ML", na_position="last")
+        diag = item_diagnostics(dfd, drill_cols, fca_level, col_month)
+        items = items.merge(diag, on=drill_cols, how="left")
+        # Sort worst FVA first, but push low-confidence rows down so the
+        # trustworthy problems surface at the top.
+        items = items.sort_values(
+            ["Conf tier", "FCA User − ML"],
+            key=lambda s: s.map({"🟩 High": 0, "🟨 Medium": 1, "🟥 Low": 2})
+            if s.name == "Conf tier" else s,
+            na_position="last")
         st.caption(f"{len(items)} item(s) at level "
                    f"**{' › '.join(drill_cols)}** · scope **{drill_flag}** · "
-                   "sorted worst FVA first.")
-        st.dataframe(items, width="stretch", hide_index=True, height=380,
-                     column_config=COLUMN_CONFIG)
+                   "sorted by confidence, then worst FVA.")
+        drill_show = (drill_cols + NUM_COLS + PCT_COLS
+                      + ["FCA User − ML", "Verdict", "Conf tier",
+                         "Confidence", "Months w/ demand", "User win rate",
+                         "Err type User", "Phasing % User"])
+        st.dataframe(items[drill_show], width="stretch", hide_index=True,
+                     height=380, column_config=DRILL_COLUMN_CONFIG)
         st.download_button(
             "⬇️ Download item table (CSV)",
-            items.to_csv(index=False).encode(),
+            items[drill_show].to_csv(index=False).encode(),
             "item_drill_in.csv", "text/csv")
 
         # ---- Monthly detail for one item ------------------------------------
@@ -571,6 +672,22 @@ else:
         pick = st.selectbox("Monthly detail for", items["_label"].tolist(),
                             key="drill_pick")
         sel_it = items[items["_label"] == pick].iloc[0]
+        di1, di2, di3, di4 = st.columns(4)
+        di1.metric("Verdict", sel_it["Verdict"])
+        di2.metric("Confidence", f"{sel_it['Confidence']:.0%}",
+                   sel_it["Conf tier"].split(" ")[1])
+        di3.metric("User error type", sel_it["Err type User"],
+                   help="Level = wrong total volume. Phasing = right total, "
+                        "wrong months — often fixable by re-timing rather "
+                        "than removing the exclusion.")
+        di4.metric("User win rate",
+                   "—" if pd.isna(sel_it["User win rate"])
+                   else f"{sel_it['User win rate']:.0%}")
+        if sel_it["Err type User"] == "⏱️ Phasing":
+            st.info("This item's user error is mostly **timing** — the total "
+                    "volume is roughly right but lands in the wrong months. "
+                    "Worth re-phasing the forecast before judging the "
+                    "exclusion itself.")
         mask = pd.Series(True, index=dfd.index)
         for c in drill_cols:
             mask &= as_str(dfd[c]) == str(sel_it[c])
