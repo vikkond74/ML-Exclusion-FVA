@@ -642,7 +642,11 @@ else:
         items = group_metrics(dfd, drill_cols, fca_level, col_month)
         items = add_verdict(items, fca_threshold)
         diag = item_diagnostics(dfd, drill_cols, fca_level, col_month)
-        items = items.merge(diag, on=drill_cols, how="left")
+        # Keep only the join keys + new diagnostic columns to avoid any
+        # duplicate-name collisions with the metrics table.
+        diag_new = [c for c in diag.columns
+                    if c in drill_cols or c not in items.columns]
+        items = items.merge(diag[diag_new], on=drill_cols, how="left")
         # Sort worst FVA first, but push low-confidence rows down so the
         # trustworthy problems surface at the top.
         items = items.sort_values(
@@ -657,6 +661,8 @@ else:
                       + ["FCA User − ML", "Verdict", "Conf tier",
                          "Confidence", "Months w/ demand", "User win rate",
                          "Err type User", "Phasing % User"])
+        drill_show = list(dict.fromkeys(drill_show))  # de-dupe, keep order
+        drill_show = [c for c in drill_show if c in items.columns]
         st.dataframe(items[drill_show], width="stretch", hide_index=True,
                      height=380, column_config=DRILL_COLUMN_CONFIG)
         st.download_button(
